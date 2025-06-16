@@ -14,8 +14,8 @@ CLEAR_BITS = True  # wipe bits_dir at start?
 MIN_SILENCE_MS = 150
 KEEP_SILENCE_MS = 100
 MIN_CHUNK_MS = 100
-MAX_CHUNK_MS = 600
-MAX_SHIFT_ST = 40.0  # absolute cap, but logic below uses smaller ranges
+MAX_CHUNK_MS = 1000
+MAX_SHIFT_ST = 30.0  # absolute cap, but logic below uses smaller ranges
 # ──────────────────────────────────────────────────────────────────────────────
 
 if CLEAR_BITS:
@@ -54,10 +54,10 @@ def calculate_shift(base, bias_female=0.4):
     if base is None or base < 50:
         return None, "unknown"
     if random.random() < bias_female:
-        st = random.uniform(5.0, 25.0)
+        st = random.uniform(5.0, 20.0)
         gender = "female"
     else:
-        st = random.uniform(-12.0, -1.0)
+        st = random.uniform(-15.0, -1.0)
         gender = "male"
     st = float(np.clip(st, -MAX_SHIFT_ST, MAX_SHIFT_ST))
     return st, gender
@@ -86,7 +86,7 @@ for idx, fname in enumerate(files, 1):
 
     # 1) Denoise
     y, sr = librosa.load(path, sr=16000)
-    y_d = nr.reduce_noise(y=y, sr=sr)
+    y_d = nr.reduce_noise(y=y, sr=sr, prop_decrease=0.5)
 
     # 2) Split on silence
     sf.write("_tmp.wav", y_d, sr)
