@@ -1,50 +1,66 @@
 #!/usr/bin/env python3
 """
-collage.py  ─ mix random bits into a 30-s ambience.
+collage.py  –  Build N stereo tracks from random speech bits,
+               then sum them into master.wav.
 
-Options:
-    python collage.py            # normal
-    python collage.py --enhance80s   # add gentle mastering polish to final mix
+    python collage.py                      # dry mix, no CSV
+    python collage.py --apply-styles       # pan/echo/reverb/stretch/gain
+    python collage.py --apply-styles --csv # same + placement CSV
 """
-import os, sys, csv, random, time
+import os, sys, random, csv, datetime
 import numpy as np
 import librosa, noisereduce as nr
 from pydub import AudioSegment, effects
 from pydub.generators import Sine
 
-# ─── CONFIG ────────────────────────────────────────────────────────────────
+# ─── USER CONFIG ───────────────────────────────────────────────────────────
 BITS_DIR = "bits"
-OUT_DIR = "out"
-OUT_WAV = os.path.join(OUT_DIR, "collage.wav")
-DEBUG_CSV = os.path.join(OUT_DIR, "collage_debug.csv")
+TRACK_COUNT = 10  # how many parallel tracks
+TARGET_MS = 30_000  # length of each track
 
-TARGET_MS = 30_000  # 30 s collage
+# silence between bits (no overlap within a track)
+MIN_SIL_MS = 100
+MAX_SIL_MS = 3_000
+
+# FX (used only with --apply-styles)
 FADE_MS = 100
-MIN_GAP_MS = 100
-MAX_GAP_MS = 800
-MAX_OVERLAP_MS = 800
-
-EXTRA_BIT_PROB = 0.3  # chance to layer extra bits
-MAX_EXTRA_BITS = 3
-
-REVERB_DELAYS = [120, 150, 170]  # ms taps
+REVERB_DELAYS = [120, 150, 170]
 REVERB_DECAY = 0.1
 ECHO_CHANCE = 0.3
 ECHO_DELAY_MS = 500
-
 STRETCH_PROB = 0.3
-STRETCH_RANGE = (0.8, 1.2)  # ±10 %
+STRETCH_RANGE = (0.8, 1.2)
+PAN_RANGE = (-1.0, 1.0)
 GAIN_RANGE_DB = (-3, +3)
 
+# hum bed
 HUM_FREQ_HZ = 60
 HUM_GAIN_DB = -10
-# ─────────────────────────────────────────────────────────────────────────────
 
+# audio template
+SAMPLE_RATE = 44_100
+CHANNELS = 2
+# ───────────────────────────────────────────────────────────────────────────
+
+# --- command-line flags ----------------------------------------------------
+apply_styles = "--apply-styles" in sys.argv
+write_csv = "--csv" in sys.argv
+
+# --- timestamped output folder --------------------------------------------
+now = datetime.datetime.now()
+stamp = now.strftime("collage_%y.%m.%d_%H.%M_") + ("s" if apply_styles else "ns")
+OUT_DIR = os.path.join("out", stamp)
 os.makedirs(OUT_DIR, exist_ok=True)
+print(f"⇒ Output folder:  {OUT_DIR}\n")
+
+# --- load bits -------------------------------------------------------------
+bit_files = [f for f in os.listdir(BITS_DIR) if f.lower().endswith(".wav")]
+bits = [(bf, AudioSegment.from_wav(os.path.join(BITS_DIR, bf))) for bf in bit_files]
+print(f"{len(bits)} bits loaded from '{BITS_DIR}'\n")
 
 
-# ——— helper FX ————————————————————————————————————————————————
-def apply_reverb(seg: AudioSegment) -> AudioSegment:
+# --- helper FX -------------------------------------------------------------
+def apply_reverb(seg):
     out = seg
     for i, d in enumerate(REVERB_DELAYS, 1):
         tap = seg - (i * (1 - REVERB_DECAY) * 10)
@@ -52,46 +68,34 @@ def apply_reverb(seg: AudioSegment) -> AudioSegment:
     return out
 
 
-def apply_echo(seg: AudioSegment) -> AudioSegment:
-    echo = seg - 10  # –10 dB
-    return seg.overlay(echo, position=ECHO_DELAY_MS)
+def apply_echo(seg):
+    return seg.overlay(seg - 10, position=ECHO_DELAY_MS)
 
 
-def maybe_stretch(seg: AudioSegment) -> AudioSegment:
+def maybe_stretch(seg):
     if random.random() > STRETCH_PROB:
         return seg
     y = np.array(seg.get_array_of_samples()).astype(np.float32) / 32768
     factor = random.uniform(*STRETCH_RANGE)
     y2 = librosa.effects.time_stretch(y=y, rate=factor)
-    data = (y2 * 32767).astype(np.int16).tobytes()
-    return AudioSegment(data, frame_rate=seg.frame_rate, sample_width=2, channels=1)
+    return AudioSegment(
+        (y2 * 32767).astype(np.int16).tobytes(),
+        frame_rate=seg.frame_rate,
+        sample_width=2,
+        channels=1,
+    )
 
 
-def auto_fix(seg: AudioSegment) -> AudioSegment:
-    """
-    Very lightweight “doctor” for each bit.
-    Fast heuristics decide which treatment to apply:
-
-    • Loud broadband hiss  → spectral-noise reduction
-    • Dull 80-ish tape     → rumble cut + air boost + low-mid dip
-    • Music-heavy section  → gentle 2 : 1 compression (+2 dB make-up)
-
-    Returns an AudioSegment ready for the rest of the FX chain.
-    """
-    # numpy view of the mono samples
-    y = np.array(seg.get_array_of_samples()).astype(np.float32) / 32768.0
+def auto_fix(seg):
+    """Very light denoise/EQ/compress per bit."""
+    y = np.array(seg.get_array_of_samples()).astype(np.float32) / 32768
     sr = seg.frame_rate
-
-    rms_db = 20 * np.log10(np.sqrt(np.mean(y**2)) + 1e-9)
-    centroid = np.mean(librosa.feature.spectral_centroid(y=y, sr=sr))
-    spectrum = np.abs(np.fft.rfft(y))
-    hi_energy = spectrum[int(len(spectrum) * 0.7) :].mean()
-    lo_energy = spectrum[: int(len(spectrum) * 0.1)].mean()
-
+    rms = 20 * np.log10(np.sqrt(np.mean(y**2)) + 1e-9)
+    cent = np.mean(librosa.feature.spectral_centroid(y=y, sr=sr))
+    spec = np.abs(np.fft.rfft(y))
+    hi, lo = spec[int(len(spec) * 0.7) :].mean(), spec[: int(len(spec) * 0.1)].mean()
     out = seg
-
-    # 1) Modern hiss / background TV ⇒ denoise
-    if rms_db > -30:  # fairly loud noise-floor
+    if rms > -30:  # noisy
         y_dn = nr.reduce_noise(y=y, sr=sr, prop_decrease=0.8)
         out = AudioSegment(
             (y_dn * 32767).astype(np.int16).tobytes(),
@@ -99,108 +103,81 @@ def auto_fix(seg: AudioSegment) -> AudioSegment:
             sample_width=2,
             channels=1,
         )
-
-    # 2) 1980s dull mono ⇒ gentle EQ brighten
-    elif centroid < 1_000:  # low spectral centroid
-        out = out.high_pass_filter(40)  # rumble cut
-        out = out.low_pass_filter(16_000).apply_gain(+2)  # air shelf
-        out = out.apply_gain(-2)  # broad low-mid dip
-
-    # 3) Music-heavy ⇒ light compression
-    if hi_energy > lo_energy * 2:
-        out = effects.compress_dynamic_range(
-            out, threshold=-18, ratio=2.0, attack=10, release=250
+    elif cent < 1_000:  # dull
+        out = (
+            out.high_pass_filter(40)
+            .low_pass_filter(16_000)
+            .apply_gain(+2)
+            .apply_gain(-2)
         )
-        out = out.apply_gain(+2)  # make-up gain
-
+    if hi > lo * 2:  # music-heavy
+        out = effects.compress_dynamic_range(
+            out, threshold=-18, ratio=2, attack=10, release=250
+        ).apply_gain(+2)
     return out
 
 
-# ————————————————————————————————————————————————————————————————
+# ---------------------------------------------------------------------------
 
+# --- blank stereo template -------------------------------------------------
+blank = AudioSegment.silent(duration=TARGET_MS, frame_rate=SAMPLE_RATE).set_channels(
+    CHANNELS
+)
+tracks = [blank[:] for _ in range(TRACK_COUNT)]
+metadata = []
 
-def enhance_80s(mix: AudioSegment) -> AudioSegment:
-    """
-    40 Hz HPF  →  +2 dB air  →  tiny pseudo-stereo  →  –3 dB gain.
-    Runs safely on stereo or mono input.
-    """
-    hp = mix.high_pass_filter(40)
-    airy = hp.low_pass_filter(16_000).apply_gain(+2)
+print("Building tracks …")
+for t in range(TRACK_COUNT):
+    cursor = 0
+    while cursor < TARGET_MS:
+        silence_len = random.randint(MIN_SIL_MS, MAX_SIL_MS)
+        start = cursor + silence_len
+        if start >= TARGET_MS:
+            break
 
-    # start from ONE mono channel
-    left = airy.split_to_mono()[0]  # guaranteed mono
-    delay = 15  # ms
-    right = AudioSegment.silent(delay) + (left - 10)  # delayed –10 dB
-    left = left + AudioSegment.silent(delay)  # pad to same length
-
-    stereo = AudioSegment.from_mono_audiosegments(left, right)
-    return stereo.apply_gain(-3)
-
-
-# ——— load bits ————————————————————————————————————————————————
-bit_list = [f for f in os.listdir(BITS_DIR) if f.lower().endswith(".wav")]
-bits = [(bf, AudioSegment.from_wav(os.path.join(BITS_DIR, bf))) for bf in bit_list]
-print(f"Loaded {len(bits)} bits from '{BITS_DIR}'")
-
-# ——— prepare timeline & hum ————————————————————————————————
-hum = Sine(HUM_FREQ_HZ).to_audio_segment(duration=TARGET_MS).apply_gain(HUM_GAIN_DB)
-timeline = AudioSegment.silent(duration=TARGET_MS)
-placements = []
-cursor = 0
-print("Building collage:")
-
-while cursor < TARGET_MS:
-    gap = random.randint(MIN_GAP_MS, MAX_GAP_MS)
-    base = min(cursor + gap, TARGET_MS)
-    if base >= TARGET_MS:
-        break
-    n = 1 + (
-        random.randint(1, MAX_EXTRA_BITS) if random.random() < EXTRA_BIT_PROB else 0
-    )
-    for _ in range(n):
         bf, seg = random.choice(bits)
-        seg = auto_fix(seg)  # <-- per-bit doctor
-        seg = maybe_stretch(seg)
-        seg = seg.apply_gain(random.uniform(*GAIN_RANGE_DB))
-        seg = seg.fade_in(FADE_MS).fade_out(FADE_MS)
-        seg = apply_reverb(seg)
-        echo_f = False
-        if random.random() < ECHO_CHANCE:
-            seg = apply_echo(seg)
-            echo_f = True
-        pan = random.uniform(-1, 1)
-        seg = seg.pan(pan)
-        dur = len(seg)
-        ov = random.randint(0, MAX_OVERLAP_MS)
-        start = max(0, base - ov)
-        timeline = timeline.overlay(seg, position=start)
-        placements.append(
-            {
-                "bit": bf,
-                "start": start,
-                "dur": dur,
-                "overlap": ov,
-                "pan": round(pan, 2),
-                "gain": round(seg.dBFS, 1),
-                "echo": echo_f,
-            }
-        )
-        print(f"  • {bf} @{start}ms ov={ov} pan={pan:+.2f}")
-    cursor = base
+        seg = auto_fix(seg)
 
-mix = hum.overlay(timeline)
+        if apply_styles:
+            seg = maybe_stretch(seg).fade_in(FADE_MS).fade_out(FADE_MS)
+            if random.random() < ECHO_CHANCE:
+                seg = apply_echo(seg)
+            seg = apply_reverb(seg)
+            seg = seg.pan(random.uniform(*PAN_RANGE))
+            seg = seg.apply_gain(random.uniform(*GAIN_RANGE_DB))
 
-# optional mastering
-if "--enhance80s" in sys.argv:
-    print("Applying final 80s enhancement…")
-    mix = enhance_80s(mix)
+        tracks[t] = tracks[t].overlay(seg, position=start)
+        metadata.append({"track": t, "bit": bf, "start_ms": start, "dur_ms": len(seg)})
+        cursor = start + len(seg)
 
-# ——— output ————————————————————————————————————————————————
-mix.export(OUT_WAV, format="wav")
-print(f"Saved collage to {OUT_WAV}")
+    track_path = os.path.join(OUT_DIR, f"track{t}.wav")
+    tracks[t].export(track_path, format="wav")
+    print(f"  track {t} written → {track_path}")
 
-with open(DEBUG_CSV, "w", newline="") as f:
-    w = csv.DictWriter(f, fieldnames=placements[0].keys())
-    w.writeheader()
-    w.writerows(placements)
-print(f"Debug CSV → {DEBUG_CSV}")
+# --- master mix ------------------------------------------------------------
+print("\nMixing master …")
+hum = (
+    Sine(HUM_FREQ_HZ)
+    .to_audio_segment(duration=TARGET_MS)
+    .apply_gain(HUM_GAIN_DB)
+    .set_channels(CHANNELS)
+)
+
+master = hum
+for tr in tracks:
+    master = master.overlay(tr)
+
+master_path = os.path.join(OUT_DIR, "master.wav")
+master.export(master_path, format="wav")
+print(f"✔  master written → {master_path}")
+
+# --- optional CSV ----------------------------------------------------------
+if write_csv and metadata:
+    csv_path = os.path.join(OUT_DIR, "collage_debug.csv")
+    with open(csv_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=metadata[0].keys())
+        w.writeheader()
+        w.writerows(metadata)
+    print(f"✔  CSV saved      → {csv_path}")
+
+print("\nDone – copy the master path above if you need it.")
