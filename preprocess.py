@@ -66,10 +66,10 @@ def calculate_shift(base, bias_female=0.4):
 def chop(chunk):
     parts, i = [], 0
     while i < len(chunk):
-        part = chunk[i : i + MIN_CHUNK_MS]
+        part = chunk[i : i + MAX_CHUNK_MS]
         if len(part) >= MIN_CHUNK_MS:
             parts.append((part, i))
-        i += MIN_CHUNK_MS // 2
+        i += MAX_CHUNK_MS // 2
     return parts
 
 
