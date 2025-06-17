@@ -1,202 +1,198 @@
-import os, time, random, csv
-import numpy as np
-import noisereduce as nr
-import pyworld as pw
-import librosa
-import soundfile as sf
+#!/usr/bin/env python3
+"""
+preprocess.py
+=============
+
+Cut long recordings into clean, ready‑to‑mix *bits*.
+
+Pipeline
+--------
+1.  **Load** every WAV in ``in/``  
+    – mono‑down‑mix if stereo  
+    – resample to **16 kHz** (fast, speech‑friendly)
+2.  **Noise‑reduce** the entire file with *noisereduce* (light spectral gate)
+3.  **Silence‑split** – any ≥150 ms gap below (loudness −14 dB) ends a segment
+4.  **Chop** each segment into ≤2 s windows (50 % hop)
+5.  **Pitch‑analyse** → optional **safe shift** (±4 st male↔female) via *PyWorld*
+6.  **Fades**:  ≤1 s ⇒ 100 ms in + out • >1 s ⇒ 300 ms in + out
+7.  **Export** bits to ``bits/`` + write `debug.csv`
+
+Run
+---
+::
+
+    python preprocess.py     # slices every WAV in ./in/
+
+All output lands in **bits/**; originals are untouched.
+"""
+# ── imports ──────────────────────────────────────────────────────────────
+import os, csv, time, random
+import numpy as np, librosa, noisereduce as nr
+import scipy.signal as ss
+from scipy.io import wavfile
 from pydub import AudioSegment, silence
+import pyworld as pw  # formant‑preserving pitch‑shift
 
-# ─── CONFIG ────────────────────────────────────────────────────────────────
-INPUT_DIR = "in"
-BITS_DIR = "bits"
-DEBUG_CSV = "debug.csv"
-CLEAR_BITS = True  # wipe bits_dir at start?
-MIN_SILENCE_MS = 150
-KEEP_SILENCE_MS = 100
-MIN_CHUNK_MS = 300
-MAX_CHUNK_MS = 2000
-MAX_SHIFT_ST = 30.0  # absolute cap, but logic below uses smaller ranges
-# ──────────────────────────────────────────────────────────────────────────────
+# ── folders ──────────────────────────────────────────────────────────────
+IN_DIR, BITS_DIR = "in", "bits"
+os.makedirs(BITS_DIR, exist_ok=True)
+CSV_PATH, WRITE_CSV = "debug.csv", True
 
-if CLEAR_BITS:
-    os.makedirs(BITS_DIR, exist_ok=True)
-    for f in os.listdir(BITS_DIR):
-        if f.lower().endswith(".wav"):
-            os.remove(os.path.join(BITS_DIR, f))
-else:
-    os.makedirs(BITS_DIR, exist_ok=True)
+# ── processing constants ────────────────────────────────────────────────
+MIN_SIL_MS, KEEP_SIL_MS = 150, 100  # silence‑split params
+WIN_MS = 2000  # chopping window (ms)
+MIN_MS, MAX_MS = 300, 2000  # keep only within this range
+FADE_S, FADE_L, EDGE_MS = 100, 300, 1000  # fade ≤1 s / >1 s threshold
+
+MALE, FEM = (80, 150), (175, 300)  # safe pitch ranges (Hz)
+MAX_SHIFT_ST = 4  # ±4 st cap
 
 
-def estimate_pitch(x, sr):
-    x64 = x.astype(np.double)
-    f0, timeaxis = pw.harvest(x64, sr, frame_period=5.0)
-    f0[f0 == 0] = np.nan
-    return float(np.nanmedian(f0)) if not np.all(np.isnan(f0)) else None
+# ── helpers ──────────────────────────────────────────────────────────────
+def to_i16(arr: np.ndarray) -> np.ndarray:
+    """Return little‑endian int16, normalised if float."""
+    if arr.dtype != np.int16:
+        peak = np.max(np.abs(arr)) or 1.0
+        arr = (arr / peak * 32767).astype("<i2")
+    return arr
 
 
-def world_pitch_shift(x, sr, semitones):
-    x64 = x.astype(np.double)
-    f0, timeaxis = pw.harvest(x64, sr, frame_period=5.0)
-    sp = pw.cheaptrick(x64, f0, timeaxis, sr)
-    ap = pw.d4c(x64, f0, timeaxis, sr)
-    ratio = 2 ** (semitones / 12)
-    f0_shifted = f0 * ratio
-    y = pw.synthesize(f0_shifted, sp, ap, sr)
-    return y.astype(np.float32)
+def fade_np(buf: np.ndarray, sr: int, ms: int) -> np.ndarray:
+    """Linear in/out fade in NumPy domain."""
+    n = int(sr * ms / 1000)
+    ramp = np.linspace(0, 1, n, False)
+    buf = buf.astype(np.float32)
+    buf[:n] *= ramp
+    buf[-n:] *= ramp[::-1]
+    return to_i16(buf)
 
 
-def calculate_shift(base, bias_female=0.4):
-    """
-    Subtler shifts:
-    - 40% chance to bias female: +1.0 to +3.0 semitones
-    - 60% chance to bias male:   -3.0 to -1.0 semitones
-    """
-    if base is None or base < 50:
-        return None, "unknown"
-    if random.random() < bias_female:
-        st = random.uniform(5.0, 20.0)
-        gender = "female"
+def yin_pitch(x: np.ndarray, sr: int):
+    f = librosa.yin(x.astype(np.float32), 50, 1000, sr)
+    f = f[f > 0]
+    return float(np.median(f)) if f.size else None
+
+
+def safe_shift(base: float | None) -> float:
+    if not base:
+        return 0.0
+    if MALE[0] <= base <= MALE[1]:
+        tgt = random.uniform(*FEM)
+    elif FEM[0] <= base <= FEM[1]:
+        tgt = random.uniform(*MALE)
     else:
-        st = random.uniform(-15.0, -1.0)
-        gender = "male"
-    st = float(np.clip(st, -MAX_SHIFT_ST, MAX_SHIFT_ST))
-    return st, gender
+        return 0.0
+    return float(np.clip(12 * np.log2(tgt / base), -MAX_SHIFT_ST, MAX_SHIFT_ST))
 
 
-def chop(chunk):
-    parts, i = [], 0
-    while i < len(chunk):
-        part = chunk[i : i + MAX_CHUNK_MS]
-        if len(part) >= MIN_CHUNK_MS:
-            parts.append((part, i))
-        i += MAX_CHUNK_MS // 2
-    return parts
+def world_shift(arr: np.ndarray, sr: int, st: float) -> np.ndarray:
+    if st == 0:
+        return arr
+    x = arr.astype(np.float64)
+    f0, t = pw.harvest(x, sr)
+    f0 *= 2 ** (st / 12)
+    sp = pw.cheaptrick(x, f0, t, sr)
+    ap = pw.d4c(x, f0, t, sr)
+    y = pw.synthesize(f0, sp, ap, sr)
+    return to_i16(np.clip(y, -1, 1))
 
 
-# Main processing
-debug_rows = []
-bit_index = 0
-files = sorted(f for f in os.listdir(INPUT_DIR) if f.lower().endswith(".wav"))
-start_all = time.time()
+def chop(seg: AudioSegment):
+    """Yield (subchunk, offset_ms) windows of ≤WIN_MS with 50 % hop."""
+    i = 0
+    while i < len(seg):
+        part = seg[i : i + WIN_MS]
+        if len(part) >= MIN_MS:
+            yield part, i
+        i += WIN_MS // 2
 
-for idx, fname in enumerate(files, 1):
-    t0 = time.time()
-    print(f"\n[{idx}/{len(files)}] {fname}")
-    path = os.path.join(INPUT_DIR, fname)
 
-    # 1) Denoise
-    y, sr = librosa.load(path, sr=16000)
-    y_d = nr.reduce_noise(y=y, sr=sr, prop_decrease=0.5)
+# ── main ─────────────────────────────────────────────────────────────────
+bit_idx, rows, t0 = 0, [], time.time()
+for idx, fname in enumerate(sorted(os.listdir(IN_DIR)), 1):
+    if not fname.lower().endswith(".wav"):
+        continue
+    print(f"[{idx}] {fname}")
 
-    # 2) Split on silence
-    sf.write("_tmp.wav", y_d, sr)
-    audio = AudioSegment.from_wav("_tmp.wav").normalize()
-    os.remove("_tmp.wav")
+    # 1 – load + mono + 16 kHz -------------------------------------------
+    sr, data = wavfile.read(os.path.join(IN_DIR, fname))
+    if data.ndim == 2:
+        data = data.mean(1).astype(np.int16)
+    if sr > 16_000:
+        dec = sr // 16_000
+        data = ss.decimate(data, dec, ftype="fir", zero_phase=True)
+        sr //= dec
+        data = to_i16(data)
 
-    thresh = audio.dBFS - 14
-    segments = silence.split_on_silence(
-        audio,
-        min_silence_len=MIN_SILENCE_MS,
-        silence_thresh=thresh,
-        keep_silence=KEEP_SILENCE_MS,
-    )
-    print(f"  → {len(segments)} speech segments")
+    # 2 – noise‑reduction -----------------------------------------------
+    data = nr.reduce_noise(y=data, sr=sr)
+    wavfile.write("tmp.wav", sr, to_i16(data))
+    full = AudioSegment.from_wav("tmp.wav")
+    os.remove("tmp.wav")
 
-    # 3) Process segments into bits
-    for seg_i, seg in enumerate(segments, 1):
-        for sub_i, (subchunk, offset) in enumerate(chop(seg), 1):
-            arr = np.array(subchunk.get_array_of_samples()).astype(np.float32) / 32768.0
+    # 3 – split on silence ----------------------------------------------
+    segs = silence.split_on_silence(full, MIN_SIL_MS, full.dBFS - 14, KEEP_SIL_MS)
+    print(f"  → {len(segs)} segments")
 
-            base_pitch = estimate_pitch(arr, sr)
-            detected_gender = (
-                "male"
-                if base_pitch and base_pitch < 180
-                else "female"
-                if base_pitch and base_pitch > 220
-                else "unknown"
-            )
+    # 4 – iterate windows -----------------------------------------------
+    for si, seg in enumerate(segs, 1):
+        for ci, (sub, off) in enumerate(chop(seg), 1):
+            arr = np.array(sub.get_array_of_samples()).astype(np.float32) / 32768
 
-            shift, target_gender = calculate_shift(base_pitch)
+            base = yin_pitch(arr, sr)
+            st = safe_shift(base)
 
-            # Attempt shift, fallback smaller if no pitch-detect
-            final_arr, final_pitch, used_shift = None, None, 0.0
-            tried = []
-            if shift is not None:
-                for factor in (1.0, 0.75, 0.5):
-                    s = shift * factor
+            tried, final, fp, used = [], None, None, 0.0
+            if st:
+                for f in (1.0, 0.75, 0.5):
+                    s = st * f
                     tried.append(round(s, 2))
-                    y_sh = world_pitch_shift(arr, sr, s)
-                    p = estimate_pitch(y_sh, sr)
+                    y = world_shift(to_i16(arr), sr, s) / 32768
+                    p = yin_pitch(y, sr)
                     if p:
-                        final_arr, final_pitch, used_shift = y_sh, p, s
+                        final, fp, used = y, p, s
                         break
-                if final_arr is None:
-                    final_arr, final_pitch = arr, base_pitch
-                    target_gender = "unchanged"
+                else:
+                    final, fp = arr, base
                     tried.append(0.0)
             else:
-                final_arr, final_pitch = arr, base_pitch
+                final, fp = arr, base
                 tried.append(0.0)
 
-            shifted_gender = (
-                "male"
-                if final_pitch and final_pitch < 180
-                else "female"
-                if final_pitch and final_pitch > 220
-                else "unknown"
-            )
-
-            duration_ms = len(final_arr) / sr * 1000  # total length *now* (ms)
-            if not (300 <= duration_ms <= 2000):
-                continue  # skip chunk that is too short / too long
-
-            # choose fade length
-            fade_ms = 100 if duration_ms <= 800 else 300
-            fade_samples = int(sr * fade_ms / 1000)
-
-            # if the chunk is still too short to hold both fades, skip it
-            if fade_samples * 2 >= len(final_arr):
+            dur = len(final) / sr * 1000
+            if not (MIN_MS <= dur <= MAX_MS):
                 continue
+            fade = FADE_S if dur <= EDGE_MS else FADE_L
+            final = fade_np(to_i16(final * 32768), sr, fade)
+            dur = len(final) / sr * 1000
 
-            # apply linear fades directly on the NumPy buffer
-            ramp = np.linspace(0.0, 1.0, fade_samples, endpoint=False)
-            final_arr[:fade_samples] *= ramp  # fade-in
-            final_arr[-fade_samples:] *= ramp[::-1]  # fade-out
+            bit = f"bit_{bit_idx:04d}.wav"
+            wavfile.write(os.path.join(BITS_DIR, bit), sr, final)
 
-            bit_name = f"bit_{bit_index:04d}.wav"
-            sf.write(os.path.join(BITS_DIR, bit_name), final_arr, sr)
-
-            debug_rows.append(
+            rows.append(
                 {
-                    "bit_file": bit_name,
+                    "bit_file": bit,
                     "original_file": fname,
-                    "start_ms": offset,
-                    "duration_ms": len(subchunk),
-                    "base_pitch_Hz": round(base_pitch, 1) if base_pitch else None,
-                    "shift_semitones": round(used_shift, 2),
-                    "final_pitch_Hz": round(final_pitch, 1) if final_pitch else None,
-                    "detected_gender": detected_gender,
-                    "target_gender": target_gender,
-                    "shifted_gender": shifted_gender,
-                    "shift_tried": ",".join(f"{v:.2f}" for v in tried),
+                    "start_ms": off,
+                    "duration_ms": round(dur),
+                    "base_pitch_Hz": round(base, 1) if base else None,
+                    "shift_semitones": round(used, 2),
+                    "final_pitch_Hz": round(fp, 1) if fp else None,
+                    "shift_tried": "/".join(map(str, tried)),
                 }
             )
 
             print(
-                f"    [{seg_i}.{sub_i}] {bit_name} | {len(subchunk)}ms | "
-                f"{base_pitch or 'None'}Hz → {used_shift:+.2f}st → "
-                f"{final_pitch or 'None'}Hz (tried {tried})"
+                f"    [{si}.{ci}] {bit} | {round(dur)} ms | {base or '?'} Hz → {used:+.2f} st → {fp or '?'} Hz"
             )
-            bit_index += 1
+            bit_idx += 1
 
-    print(f"  → done in {time.time() - t0:.1f}s")
+print(f"\n✔ {bit_idx} bits written in {time.time()-t0:.1f} s")
 
-print(f"\n🏁 Completed in {time.time() - start_all:.1f}s — {bit_index} bits total.")
-
-# Write debug CSV
-with open(DEBUG_CSV, "w", newline="") as f:
-    writer = csv.DictWriter(f, fieldnames=list(debug_rows[0].keys()))
-    writer.writeheader()
-    writer.writerows(debug_rows)
-
-print(f"Debug saved to {DEBUG_CSV}")
+# CSV log -------------------------------------------------------------
+if WRITE_CSV and rows:
+    with open(CSV_PATH, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=rows[0].keys())
+        w.writeheader()
+        w.writerows(rows)
+    print(f"CSV → {CSV_PATH}")

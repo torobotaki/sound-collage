@@ -14,7 +14,7 @@ _Python utilities to slice, clean, pitch‑shift & re‑compose sound files. Its
 * Splits on silence, keeps only chunks **300 – 2000 ms**
 
   * ≤ 1000 ms → **100 ms** fades ‑‑> body ‑‑> **100 ms** fades
-  * >  1000 ms → **300 ms** fades
+  * \>  1000 ms → **300 ms** fades
 * Safe ± 4 st pitch‑shift (PyWorld) into male / female range
 * Exports numbered bits to **`bits/`** and logs to `debug.csv`
 
