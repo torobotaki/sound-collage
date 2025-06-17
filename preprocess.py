@@ -13,8 +13,8 @@ DEBUG_CSV = "debug.csv"
 CLEAR_BITS = True  # wipe bits_dir at start?
 MIN_SILENCE_MS = 150
 KEEP_SILENCE_MS = 100
-MIN_CHUNK_MS = 100
-MAX_CHUNK_MS = 1000
+MIN_CHUNK_MS = 300
+MAX_CHUNK_MS = 2000
 MAX_SHIFT_ST = 30.0  # absolute cap, but logic below uses smaller ranges
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -66,10 +66,10 @@ def calculate_shift(base, bias_female=0.4):
 def chop(chunk):
     parts, i = [], 0
     while i < len(chunk):
-        part = chunk[i : i + MAX_CHUNK_MS]
+        part = chunk[i : i + MIN_CHUNK_MS]
         if len(part) >= MIN_CHUNK_MS:
             parts.append((part, i))
-        i += MAX_CHUNK_MS // 2
+        i += MIN_CHUNK_MS // 2
     return parts
 
 
@@ -145,6 +145,23 @@ for idx, fname in enumerate(files, 1):
                 if final_pitch and final_pitch > 220
                 else "unknown"
             )
+
+            duration_ms = len(final_arr) / sr * 1000  # total length *now* (ms)
+            if not (300 <= duration_ms <= 2000):
+                continue  # skip chunk that is too short / too long
+
+            # choose fade length
+            fade_ms = 100 if duration_ms <= 800 else 300
+            fade_samples = int(sr * fade_ms / 1000)
+
+            # if the chunk is still too short to hold both fades, skip it
+            if fade_samples * 2 >= len(final_arr):
+                continue
+
+            # apply linear fades directly on the NumPy buffer
+            ramp = np.linspace(0.0, 1.0, fade_samples, endpoint=False)
+            final_arr[:fade_samples] *= ramp  # fade-in
+            final_arr[-fade_samples:] *= ramp[::-1]  # fade-out
 
             bit_name = f"bit_{bit_index:04d}.wav"
             sf.write(os.path.join(BITS_DIR, bit_name), final_arr, sr)
