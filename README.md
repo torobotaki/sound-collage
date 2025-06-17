@@ -5,7 +5,7 @@ _Python utilities to slice, clean, pitch‑shift & re‑compose sound files. Its
 
 ---
 
-###1·Overview
+### 1. Overview
 * **`preprocess.py`**  
 • Reads raw `.wav` files from **`in/`**  
 • Mono‑downs, resamples to 16kHz, runs light noise‑reduction  
@@ -22,7 +22,7 @@ _Python utilities to slice, clean, pitch‑shift & re‑compose sound files. Its
 inside a timestamped **`out/`** folder.
 
 ---
-###2·QuickStart
+### 2. QuickStart
 ```bash
 # clone & create virtual‑env
 git clone https://github.com/yourname/terirem-toolkit.git
@@ -42,14 +42,14 @@ python collage.py             # → mix in ./out/
 python collage.py --apply-styles --pattern "SSLCCMMhhDD" --bpm 100
 ```
 ---
-###3·Command‑Line Flags
+### 3. Command‑Line Flags
 
-####`preprocess.py`
+#### `preprocess.py`
 | flag | description |
 |------|-------------|
 | _(none)_ | process every `.wav` in **`in/`** → `bits/` |
 
-####`collage.py`
+#### `collage.py`
 | flag | default | description |
 |------|---------|-------------|
 | `--pattern STR`  | `"M"` | Section pattern: `L``M``H``S``C``D` (upper‑case=all tracks), `l``m``h` (solo track‑0) |
@@ -59,7 +59,7 @@ python collage.py --apply-styles --pattern "SSLCCMMhhDD" --bpm 100
 | `--help`         | –     | Show extended pattern syntax |
 
 ---
-###4·InstallingDependencies
+### 4. InstallingDependencies
 ```bash
 # Debian/Ubuntu
 sudo apt update && sudo apt install ffmpeg libsndfile1 build-essential
@@ -73,7 +73,7 @@ pip install -r requirements.txt
 *`ffmpeg` is required by PyDub; `libsndfile` speeds up `soundfile`.*
 
 ---
-###5·RepoLayout
+### 5. RepoLayout
 ```
 terirem-toolkit/
 ├─ in/            # raw source WAVs
@@ -87,7 +87,7 @@ terirem-toolkit/
 ```
 
 ---
-###6·Troubleshooting
+### 6. Troubleshooting
 | issue | fix |
 |-------|-----|
 | silence / white noise in bits | ensureFFmpeg inPATH and`libsndfile` installed |
@@ -95,5 +95,5 @@ terirem-toolkit/
 | master clipping | reduce track count or drop `--apply-styles`, then normalise externally |
 
 ---
-###7·License
+### 7. License
 MIT License ©2025 Dialekti Valsamou-Stanislawski
